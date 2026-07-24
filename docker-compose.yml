@@ -1,0 +1,403 @@
+name: working_code
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: feedflash-mongo
+    restart: unless-stopped
+    command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.5"]
+    stop_grace_period: 60s
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - feedflash_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 15s
+      retries: 6
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: feedflash-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save "" --appendonly no
+    volumes:
+      - feedflash_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: feedflash-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: feedflash-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      # RAM-first: rely on the OS page cache and only flush segments to disk
+      # every ~5 minutes (or 1B messages), instead of fsync-ing constantly.
+      KAFKA_LOG_FLUSH_INTERVAL_MS: 300000
+      KAFKA_LOG_FLUSH_INTERVAL_MESSAGES: 1000000000
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 45s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: feedflash-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "cub kafka-ready -b kafka:29092 1 60 &&
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists
+      --topic flashfeed-events --partitions 1 --replication-factor 1"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Infrastructure/server/Dockerfile
+    container_name: feedflash-backend
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/feedflash}
+      MONGO_DB: ${MONGO_DB:-feedflash}
+      MONGODB_DB: ${MONGODB_DB:-feedflash}
+      MONGO_SERVER_SELECTION_TIMEOUT_MS: ${MONGO_SERVER_SELECTION_TIMEOUT_MS:-3000}
+      REDIS_URL: redis://redis:6379/0
+      # Entry/exit screeners join Mongo quote rows with the chart-service's
+      # batch endpoints (/api/sentchart/corr/batch, /api/sentchart/positions/batch).
+      CHART_SERVICE_URL: http://chart-service:5050
+      FINVIZ_AUTH_TOKEN: ${FINVIZ_AUTH_TOKEN:-${FINVIZ_TOKEN:-}}
+      FINVIZ_TOKEN: ${FINVIZ_TOKEN:-${FINVIZ_AUTH_TOKEN:-}}
+      FINVIZ_COOKIE: ${FINVIZ_COOKIE:-}
+      FINVIZ_LOGIN: ${FINVIZ_LOGIN:-}
+      FINVIZ_PASSWORD: ${FINVIZ_PASSWORD:-}
+      VAR_ROOT: /var/lib/flashfeed-auth
+      TRADINGVIEW_SCREENER_LIMIT: ${TRADINGVIEW_SCREENER_LIMIT:-10000}
+      BENZINGA_API_KEY: ${BENZINGA_API_KEY:-}
+      DOW_JONES_API_KEY: ${DOW_JONES_API_KEY:-}
+      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
+      GROK_API_KEY: ${GROK_API_KEY:-}
+      GROK_MODEL: ${GROK_MODEL:-grok-3-mini}
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID:-}
+      REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET:-}
+      REDDIT_ACCESS_TOKEN: ${REDDIT_ACCESS_TOKEN:-}
+      SOCIAL_REDDIT_PUBLIC_FALLBACK: ${SOCIAL_REDDIT_PUBLIC_FALLBACK:-true}
+      SOCIAL_REDDIT_TIMEOUT: ${SOCIAL_REDDIT_TIMEOUT:-8}
+      SCHWAB_ACCESS_TOKEN: ${SCHWAB_ACCESS_TOKEN:-}
+      SCHWAB_TRADING_ENABLED: ${SCHWAB_TRADING_ENABLED:-false}
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-7497}
+      IBKR_ENABLE_TRADING: ${IBKR_ENABLE_TRADING:-false}
+      IBKR_ENABLE_NEWS: ${IBKR_ENABLE_NEWS:-false}
+      OPTIONS_API_KEY: ${OPTIONS_API_KEY:-}
+      FUTURES_API_KEY: ${FUTURES_API_KEY:-}
+      SEC_CONTACT_EMAIL: ${SEC_CONTACT_EMAIL:-otisemurray@icloud.com}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-FeedFlash/1.0 otisemurray@icloud.com}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: flashfeed-events
+      KAFKA_PUBLISH_NEWS: ${KAFKA_PUBLISH_NEWS:-true}
+      DECISION_MAP_DB_NAME: ${DECISION_MAP_DB_NAME:-feedflash_decision_map}
+      DECISION_MAP_KAFKA_PUBLISH: ${DECISION_MAP_KAFKA_PUBLISH:-true}
+      DECISION_MAP_REDIS_TTL: ${DECISION_MAP_REDIS_TTL:-300}
+      DECISION_MAP_PATH_TTL: ${DECISION_MAP_PATH_TTL:-21600}
+      DECISION_MAP_PATH_MAX: ${DECISION_MAP_PATH_MAX:-180}
+      DECISION_MAP_POINT_INTERVAL_SECONDS: ${DECISION_MAP_POINT_INTERVAL_SECONDS:-60}
+      KAFKA_NEWS_MAX_TICKERS: ${KAFKA_NEWS_MAX_TICKERS:-500}
+      RSS_FEED_ENTRY_LIMIT: ${RSS_FEED_ENTRY_LIMIT:-0}
+      ACCESS_NEWSWIRE_PAGE_SIZE: ${ACCESS_NEWSWIRE_PAGE_SIZE:-500}
+      UNSTRUCTURED_MAX_PER_SOURCE: ${UNSTRUCTURED_MAX_PER_SOURCE:-0}
+      FAST_UNSTRUCTURED_SOURCE_FILTER: ${FAST_UNSTRUCTURED_SOURCE_FILTER:-Finviz News Flow,TradingView News}
+      DEFAULT_FETCH_MODE: ${DEFAULT_FETCH_MODE:-fast}
+      PREDICTION_MAINTENANCE_INTERVAL_MS: ${PREDICTION_MAINTENANCE_INTERVAL_MS:-300000}
+      OHLCV_HYDRATION_INTERVAL_MS: ${OHLCV_HYDRATION_INTERVAL_MS:-300000}
+      OHLCV_HYDRATION_LIMIT: ${OHLCV_HYDRATION_LIMIT:-40}
+      OHLCV_HYDRATION_CONCURRENCY: ${OHLCV_HYDRATION_CONCURRENCY:-6}
+      ENABLE_QUOTE_FETCH: ${ENABLE_QUOTE_FETCH:-0}
+      QUOTE_MAX_TICKERS: ${QUOTE_MAX_TICKERS:-100}
+      FETCH_MIN_INTERVAL_MS: ${FETCH_MIN_INTERVAL_MS:-10000}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      API_TOKEN: ${API_TOKEN:-}
+      API_TOKEN_SCOPE: ${API_TOKEN_SCOPE:-write}
+      AUTO_REFRESH_ENABLED: ${AUTO_REFRESH_ENABLED:-true}
+      ONSITE_FETCH_ENABLED: ${ONSITE_FETCH_ENABLED:-true}
+      ONSITE_FETCH_INTERVAL_MS: ${ONSITE_FETCH_INTERVAL_MS:-60000}
+      AUTO_GRAB_ENABLED: ${AUTO_GRAB_ENABLED:-false}
+      AUTO_GRAB_RUN_FETCH: ${AUTO_GRAB_RUN_FETCH:-true}
+      NODE_ENV: development
+    volumes:
+      - finviz_auth_data:/var/lib/flashfeed-auth
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: feedflash-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+      chart-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/overview || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  kafka-consumer:
+    build:
+      context: .
+      dockerfile: Infrastructure/kafka/Dockerfile
+    container_name: feedflash-kafka-consumer
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: flashfeed-events
+      KAFKA_GROUP_ID: flashfeed-consumer-group
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_TTL: 3600
+      REDIS_FEED_MAX: 100
+      DECISION_MAP_DB_NAME: ${DECISION_MAP_DB_NAME:-feedflash_decision_map}
+      DECISION_MAP_PATH_TTL: ${DECISION_MAP_PATH_TTL:-21600}
+      DECISION_MAP_PATH_MAX: ${DECISION_MAP_PATH_MAX:-180}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/feedflash}
+      MONGODB_DB: ${MONGODB_DB:-feedflash}
+      MONGODB_COLLECTION: events
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  rss-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.rss
+    container_name: feedflash-rss-worker
+    restart: unless-stopped
+    environment:
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/feedflash}
+      MONGO_DB: ${MONGO_DB:-feedflash}
+      MONGODB_DB: ${MONGODB_DB:-feedflash}
+      MONGO_SERVER_SELECTION_TIMEOUT_MS: ${MONGO_SERVER_SELECTION_TIMEOUT_MS:-3000}
+      REDIS_URL: redis://redis:6379/0
+      FINVIZ_AUTH_TOKEN: ${FINVIZ_AUTH_TOKEN:-${FINVIZ_TOKEN:-}}
+      FINVIZ_TOKEN: ${FINVIZ_TOKEN:-${FINVIZ_AUTH_TOKEN:-}}
+      FINVIZ_COOKIE: ${FINVIZ_COOKIE:-}
+      TRADINGVIEW_SCREENER_LIMIT: ${TRADINGVIEW_SCREENER_LIMIT:-10000}
+      BENZINGA_API_KEY: ${BENZINGA_API_KEY:-}
+      DOW_JONES_API_KEY: ${DOW_JONES_API_KEY:-}
+      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
+      REDDIT_CLIENT_ID: ${REDDIT_CLIENT_ID:-}
+      REDDIT_CLIENT_SECRET: ${REDDIT_CLIENT_SECRET:-}
+      REDDIT_ACCESS_TOKEN: ${REDDIT_ACCESS_TOKEN:-}
+      SOCIAL_REDDIT_PUBLIC_FALLBACK: ${SOCIAL_REDDIT_PUBLIC_FALLBACK:-true}
+      SOCIAL_REDDIT_TIMEOUT: ${SOCIAL_REDDIT_TIMEOUT:-8}
+      SCHWAB_ACCESS_TOKEN: ${SCHWAB_ACCESS_TOKEN:-}
+      SCHWAB_TRADING_ENABLED: ${SCHWAB_TRADING_ENABLED:-false}
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-7497}
+      IBKR_ENABLE_TRADING: ${IBKR_ENABLE_TRADING:-false}
+      IBKR_ENABLE_NEWS: ${IBKR_ENABLE_NEWS:-false}
+      OPTIONS_API_KEY: ${OPTIONS_API_KEY:-}
+      FUTURES_API_KEY: ${FUTURES_API_KEY:-}
+      SEC_CONTACT_EMAIL: ${SEC_CONTACT_EMAIL:-otisemurray@icloud.com}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-FeedFlash/1.0 otisemurray@icloud.com}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      RSS_FEED_ENTRY_LIMIT: ${RSS_FEED_ENTRY_LIMIT:-0}
+      RSS_WORKER_INTERVAL_SECONDS: ${RSS_WORKER_INTERVAL_SECONDS:-60}
+      UNSTRUCTURED_MAX_PER_SOURCE: ${UNSTRUCTURED_MAX_PER_SOURCE:-0}
+      FAST_UNSTRUCTURED_SOURCE_FILTER: ${FAST_UNSTRUCTURED_SOURCE_FILTER:-Finviz News Flow,TradingView News}
+      ACCESS_NEWSWIRE_PAGE_SIZE: ${ACCESS_NEWSWIRE_PAGE_SIZE:-500}
+    command: ["sh", "-c", "while true; do python 1_News/pipeline/fetch_rss_to_mongo.py; sleep ${RSS_WORKER_INTERVAL_SECONDS:-60}; done"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    profiles:
+      - worker
+
+  sentiment-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.sentiment
+    container_name: feedflash-sentiment-worker
+    restart: unless-stopped
+    environment:
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/feedflash}
+      MONGO_DB: ${MONGO_DB:-feedflash}
+      MONGODB_DB: ${MONGODB_DB:-feedflash}
+      MONGO_SERVER_SELECTION_TIMEOUT_MS: ${MONGO_SERVER_SELECTION_TIMEOUT_MS:-3000}
+      REDIS_URL: redis://redis:6379/0
+      FINVIZ_AUTH_TOKEN: ${FINVIZ_AUTH_TOKEN:-${FINVIZ_TOKEN:-}}
+      FINVIZ_TOKEN: ${FINVIZ_TOKEN:-${FINVIZ_AUTH_TOKEN:-}}
+      FINVIZ_COOKIE: ${FINVIZ_COOKIE:-}
+      TRADINGVIEW_SCREENER_LIMIT: ${TRADINGVIEW_SCREENER_LIMIT:-10000}
+      BENZINGA_API_KEY: ${BENZINGA_API_KEY:-}
+      DOW_JONES_API_KEY: ${DOW_JONES_API_KEY:-}
+      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
+      SCHWAB_ACCESS_TOKEN: ${SCHWAB_ACCESS_TOKEN:-}
+      SCHWAB_TRADING_ENABLED: ${SCHWAB_TRADING_ENABLED:-false}
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-7497}
+      IBKR_ENABLE_TRADING: ${IBKR_ENABLE_TRADING:-false}
+      IBKR_ENABLE_NEWS: ${IBKR_ENABLE_NEWS:-false}
+      OPTIONS_API_KEY: ${OPTIONS_API_KEY:-}
+      FUTURES_API_KEY: ${FUTURES_API_KEY:-}
+      SEC_CONTACT_EMAIL: ${SEC_CONTACT_EMAIL:-otisemurray@icloud.com}
+      SEC_USER_AGENT: ${SEC_USER_AGENT:-FeedFlash/1.0 otisemurray@icloud.com}
+      FINBERT_MODEL: ProsusAI/finbert
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - hf_sentiment_cache:/tmp/hf_cache
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    profiles:
+      - worker
+
+
+  auto-refresh-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.auto-refresh
+    container_name: feedflash-auto-refresh
+    restart: unless-stopped
+    environment:
+      BACKEND_URL: http://backend:3001
+      # The backend's presence-aware one-minute scheduler is authoritative.
+      # Keep this legacy external loop available, but disabled to prevent two
+      # independent schedulers from competing for the refresh lock.
+      AUTO_REFRESH_ENABLED: ${EXTERNAL_AUTO_REFRESH_ENABLED:-false}
+      AUTO_REFRESH_MODE: ${AUTO_REFRESH_MODE:-auto}
+      AUTO_REFRESH_INTERVAL_SECONDS: ${AUTO_REFRESH_INTERVAL_SECONDS:-60}
+      AUTO_REFRESH_TIMEOUT_SECONDS: ${AUTO_REFRESH_TIMEOUT_SECONDS:-55}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      API_TOKEN: ${API_TOKEN:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+
+  news-source-guard:
+    build:
+      context: .
+      dockerfile: Dockerfile.news-source-guard
+    container_name: feedflash-news-source-guard
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      NEWS_SOURCE_GUARD_INTERVAL_SEC: ${NEWS_SOURCE_GUARD_INTERVAL_SEC:-120}
+
+
+  # flashfeed sentchart chart-data service (chart-service). Candles (Finviz
+  # 1-min OHLC + RSI/MACD/Bollinger) + live density/sentiment overlays
+  # (StockTwits walk + its OWN Mongo store). Flask on :5050.
+  chart-service:
+    build:
+      context: .
+      dockerfile: chart-service/Dockerfile
+    container_name: feedflash-chart-service
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    environment:
+      PORT: 5050
+      FINVIZ_TOKEN: ${FINVIZ_TOKEN:-}
+      FINVIZ_AUTH_TOKEN: ${FINVIZ_AUTH_TOKEN:-}
+      FINVIZ_LOGIN: ${FINVIZ_LOGIN:-}
+      FINVIZ_PASSWORD: ${FINVIZ_PASSWORD:-}
+      VAR_ROOT: /var/lib/flashfeed-auth
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      # Target this compose's mongo service (not localhost, which would fall
+      # back to in-memory). Use chart-service's OWN db/collection so it stays
+      # decoupled from feedflash's other Mongo usage.
+      MONGO_URI: ${MONGODB_URI:-mongodb://mongo:27017}
+      MONGO_DB: ${MONGO_DB:-flashfeed}
+      MONGO_COLL: ${MONGO_COLL:-social_history}
+      # TradingView login (owner's paid account) — real overnight 20:00-04:00
+      # prices via Blue Ocean on the 24-h chart. Optional: without them the
+      # chart falls back to the dashed prior-close carry overnight.
+      TV_USERNAME: ${TV_USERNAME:-}
+      TV_PASSWORD: ${TV_PASSWORD:-}
+    volumes:
+      - finviz_auth_data:/var/lib/flashfeed-auth
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+
+volumes:
+  hf_sentiment_cache:
+  feedflash_mongo_data:
+  feedflash_redis_data:
+  finviz_auth_data:
